@@ -1,0 +1,30 @@
+# mintcall
+
+> mintcall is a local, mint-on-call credential broker for AI agents. Agent configs (mcp.json etc.) hold no secrets. For each outbound API call an agent asks the local broker for a grant that is single-use, bound to the exact request (method + canonical URL + body hash), short-lived and spend-capped. A loopback proxy verifies the grant and the agent's Ed25519 signature, injects the real key, forwards the call, and writes a hash-chained, signed receipt. The agent never sees the key. Python 3.10+, Apache-2.0. Status: v0, looking for design partners (a2a@mail.grokbot.com).
+
+## CLI commands
+- `mintcall init`: create the home dir (~/.mintcall) and an example policy
+- `mintcall add-credential NAME --recipient URL [--header H --format "{secret}"]`: store a key in the encrypted vault, pinned to one origin
+- `mintcall credentials`: list stored credential names
+- `mintcall agent add NAME --out KEYFILE | --public-key B64`, `mintcall agent list`, `mintcall agent remove NAME`: manage agent Ed25519 identities
+- `mintcall request --agent A --agent-key KEYFILE --credential NAME --method M --url URL [--body ..] --scope S --cap N --ttl SECS --why TEXT`: agent asks for a grant for one call
+- `mintcall sign-claim --agent-key KEYFILE --token TOKEN --url URL [--method M]`: print the X-Mintcall-* signature headers for a claim
+- `mintcall approve GRANT_ID`: approve a grant pending under an `ask` policy rule
+- `mintcall revoke GRANT_ID | --agent A`: revoke grants
+- `mintcall list [--status S]`, `mintcall sweep`: inspect grants, expire timed-out ones
+- `mintcall proxy --port 8787 [--key-ttl 30]`: run the loopback proxy that injects keys
+- `mintcall verify-log`: verify the signed receipt chain
+
+## Docs
+- [README](https://github.com/aether-cell/mintcall/blob/main/README.md)
+- [Install](https://github.com/aether-cell/mintcall/blob/main/README.md#install)
+- [60-second demo](https://github.com/aether-cell/mintcall/blob/main/README.md#60-second-demo)
+- [How it works](https://github.com/aether-cell/mintcall/blob/main/README.md#how-it-works)
+- [CLI](https://github.com/aether-cell/mintcall/blob/main/README.md#cli)
+- [Wrapping an MCP server](https://github.com/aether-cell/mintcall/blob/main/README.md#wrapping-an-mcp-server)
+- [Threat model limits](https://github.com/aether-cell/mintcall/blob/main/README.md#threat-model-limits-known-limits-v0)
+- [Threat model and comparison](https://github.com/aether-cell/mintcall/blob/main/README.md#threat-model--vs-secretless-grant)
+
+## Optional
+- [Example MCP wrapper](https://github.com/aether-cell/mintcall/blob/main/examples/mcp_tool_wrapper.py)
+- [License (Apache-2.0)](https://github.com/aether-cell/mintcall/blob/main/LICENSE)

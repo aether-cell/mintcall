@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "weather": {
+      "command": "python",
+      "args": ["examples/mcp_tool_wrapper.py", "--serve"],
+      "env": { "MINTCALL_AGENT": "demo-agent", "MINTCALL_HOME": "~/.mintcall" }
+    }
+  }
+}

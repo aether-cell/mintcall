@@ -1,0 +1,8 @@
+*.vault
+*.db
+*.key
+receipts.jsonl
+.mintcall/
+__pycache__/
+.venv/
+*.egg-info/
