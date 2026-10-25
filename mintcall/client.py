@@ -11,13 +11,14 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 _OPENER = urllib.request.build_opener(_NoRedirect)
 
-def request_grant(broker, signer, credential, method, url, body=b"", scope=("read",), cap=0.0, ttl=60, intent=None):
-    auth = signer.sign("request", request_fields(credential, method, url, body, scope, cap, ttl, intent))
-    return broker.request(signer.agent_id, credential, method, url, body, scope=scope, cap=cap, ttl=ttl, intent=intent, auth=auth)
+def request_grant(broker, signer, credential, method, url, body=b"", scope=("read",), cap=0.0, ttl=60, intent=None, task_id=None):
+    auth = signer.sign("request", request_fields(credential, method, url, body, scope, cap, ttl, intent, task_id))
+    return broker.request(signer.agent_id, credential, method, url, body, scope=scope, cap=cap, ttl=ttl, intent=intent,
+                          auth=auth, task_id=task_id)
 
 def call_via_proxy(broker, signer, credential, method, url, body=b"", scope=("read",), cap=0.0, ttl=60,
-                   intent=None, proxy="http://127.0.0.1:8787", headers=None):
-    g = request_grant(broker, signer, credential, method, url, body, scope, cap, ttl, intent)
+                   intent=None, proxy="http://127.0.0.1:8787", headers=None, task_id=None):
+    g = request_grant(broker, signer, credential, method, url, body, scope, cap, ttl, intent, task_id)
     if g["status"] != "minted":
         return {"pending_approval": g["grant_id"]}
     return send(g["token"], method, url, body, proxy, headers, signer=signer)

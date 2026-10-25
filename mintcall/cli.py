@@ -25,6 +25,7 @@ def main(argv=None):
     r.add_argument("--method", default="GET"); r.add_argument("--url", required=True); r.add_argument("--body", default="")
     r.add_argument("--scope", default="read"); r.add_argument("--cap", type=float, default=0.0)
     r.add_argument("--ttl", type=int, default=60); r.add_argument("--why", default="")
+    r.add_argument("--task-id", help="bind the grant to an open task (refused once that task ends)")
     for n in ("approve", "revoke"):
         x = s.add_parser(n); x.add_argument("grant_id", nargs="?")
         if n == "revoke": x.add_argument("--agent")
@@ -38,6 +39,14 @@ def main(argv=None):
     aa.add_argument("agent_id"); aa.add_argument("--out", help="where to write the agent's private key (0600)")
     aa.add_argument("--public-key", help="register this base64 Ed25519 public key instead of generating one")
     ar = ags.add_parser("remove"); ar.add_argument("agent_id"); ags.add_parser("list")
+    tk = s.add_parser("task", help="runner side: task lifecycle events (task_open / task_end)")
+    tks = tk.add_subparsers(dest="task_cmd", required=True)
+    to = tks.add_parser("open"); to.add_argument("task_id"); to.add_argument("--timestamp")
+    te = tks.add_parser("end", help="refuse further grants/uses for the task; run BEFORE killing its process group")
+    te.add_argument("task_id"); te.add_argument("--timestamp")
+    dg = te.add_mutually_exclusive_group(required=True)
+    dg.add_argument("--destructor-ok", dest="dok", action="store_true"); dg.add_argument("--destructor-failed", dest="dok", action="store_false")
+    tf = tks.add_parser("event", help="apply a JSON lifecycle event from a file ('-' = stdin)"); tf.add_argument("file")
     sg = s.add_parser("sign-claim", help="agent side: print X-Mintcall-* auth headers for a claim")
     sg.add_argument("--agent-key", required=True); sg.add_argument("--token", required=True)
     sg.add_argument("--method", default="GET"); sg.add_argument("--url", required=True); sg.add_argument("--body", default="")
@@ -57,9 +66,9 @@ def main(argv=None):
             from .broker import request_fields
             k = AgentKey.load(a.agent_key); sc = a.scope.split(",")
             intent = {"why": a.why, "method": a.method, "url": a.url, "cap": a.cap}
-            auth = k.sign("request", request_fields(a.credential, a.method, a.url, a.body.encode(), sc, a.cap, a.ttl, intent))
+            auth = k.sign("request", request_fields(a.credential, a.method, a.url, a.body.encode(), sc, a.cap, a.ttl, intent, a.task_id))
             g = broker(a, True).request(a.agent, a.credential, a.method, a.url, a.body.encode(),
-                scope=sc, cap=a.cap, ttl=a.ttl, intent=intent, auth=auth)
+                scope=sc, cap=a.cap, ttl=a.ttl, intent=intent, auth=auth, task_id=a.task_id)
             print(json.dumps(g, indent=2))
         elif a.cmd == "approve": broker(a).approve(a.grant_id); print("approved", a.grant_id)
         elif a.cmd == "revoke": print("revoked", broker(a).revoke(a.grant_id, a.agent))
@@ -85,6 +94,13 @@ def main(argv=None):
                     print(f"registered {a.agent_id}; private key -> {a.out} (give it only to that agent)")
             elif a.agent_cmd == "remove": print("removed" if reg.remove(a.agent_id) else "not found", a.agent_id)
             else: print("\n".join(reg.names()))
+        elif a.cmd == "task":
+            from datetime import datetime, timezone
+            ts = lambda: getattr(a, "timestamp", None) or datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+            if a.task_cmd == "open": out = broker(a).task_open({"task_id": a.task_id, "timestamp": ts()})
+            elif a.task_cmd == "end": out = broker(a).task_end({"task_id": a.task_id, "timestamp": ts(), "destructorOk": a.dok})
+            else: out = broker(a).task_event(json.loads(sys.stdin.read() if a.file == "-" else Path(a.file).read_text()))
+            print(json.dumps(out, indent=2))
         elif a.cmd == "sign-claim":
             from .agents import AgentKey, auth_headers
             from .broker import claim_fields

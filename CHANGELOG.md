@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- **Per-task-id grant scoping.** Grants can carry an optional `task_id` (covered by the request signature). The broker accepts `task_open {task_id, timestamp}` and `task_end {task_id, timestamp, destructorOk}` (Python API `Broker.task_open/task_end/task_event`, CLI `mintcall task open|end|event`). A task-bound grant can be minted or used only while its task is open; unknown or ended tasks get 403 with the reason. On `task_end` the broker first refuses all new grants and uses for the task and revokes its unused grants, then writes a signed `task_end` receipt listing `revoked_grant_ids`. Teardown is the runner's job: kill the process group only after `task_end` returns (see `examples/task_runner.py`). Sample events in `examples/task_events.jsonl`.
 - Proxy marks 3xx responses with `X-Mintcall-Redirect: refused`.
 - Regression tests: 307 and 308 (GET and POST), plus 301/302/303, redirecting to a different origin are never followed by the proxy or client, and nothing (no key, no grant token) reaches the other origin.
 

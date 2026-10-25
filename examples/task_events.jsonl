@@ -1,0 +1,2 @@
+{"event": "task_open", "task_id": "task-7f3a2c", "transition": "none -> open", "timestamp": "2026-10-25T18:02:11Z"}
+{"event": "task_end", "task_id": "task-7f3a2c", "transition": "open -> ended", "timestamp": "2026-10-25T18:09:47Z", "destructorOk": true}

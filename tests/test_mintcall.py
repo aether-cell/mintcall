@@ -376,3 +376,118 @@ def test_cross_origin_redirect_refused_and_key_never_sent(env, code, method):
     assert r["headers"].get("X-Mintcall-Settled") == "0"
     assert KEY not in r["body"] and KEY not in json.dumps(r["headers"])
     assert b.list()[0]["status"] == "failed" and b.spent("demo-agent", "demo-api") == 0
+
+# ---------- per-task-id grant scoping ----------
+def _open(b, tid="task-1", ts="2026-01-01T00:00:00Z"): return b.task_open({"task_id": tid, "timestamp": ts})
+def _end(b, tid="task-1", ts="2026-01-01T00:05:00Z", ok=True):
+    return b.task_end({"task_id": tid, "timestamp": ts, "destructorOk": ok})
+
+def test_grant_minted_and_used_under_open_task(env):
+    b, api, proxy, *_ = env
+    _open(b)
+    g = grant(b, api, task_id="task-1")
+    assert g["status"] == "minted" and g["task_id"] == "task-1"
+    r = send(g["token"], "GET", api + "/v1/items", proxy=proxy)
+    assert r["status"] == 200 and json.loads(r["body"])["authed"]
+
+def test_task_end_refuses_new_grants_and_uses(env):
+    b, api, proxy, *_ = env
+    _open(b); _open(b, "task-2")
+    unused = grant(b, api, task_id="task-1")
+    pending = grant(b, api, "/v1/orders", "POST", b"{}", cap=2, task_id="task-1")
+    assert pending["status"] == "pending_approval"
+    other = grant(b, api, task_id="task-2")          # a different task's grant is untouched
+    plain = grant(b, api)                            # an unbound grant is untouched
+    end = _end(b)
+    assert set(end["revoked_grant_ids"]) == {unused["grant_id"], pending["grant_id"]}
+    # use after task_end: 403 with the task reason (not just "revoked")
+    r = send(unused["token"], "GET", api + "/v1/items", proxy=proxy)
+    assert r["status"] == 403 and "task 'task-1' has ended" in r["body"]
+    with pytest.raises(GrantError, match="not pending"): b.approve(pending["grant_id"])
+    # new mint for the ended task
+    with pytest.raises(GrantError, match="task 'task-1' has ended"): grant(b, api, task_id="task-1")
+    # the ended task cannot be reopened or ended twice
+    with pytest.raises(GrantError, match="single-use"): _open(b)
+    with pytest.raises(GrantError, match="already ended"): _end(b)
+    assert send(other["token"], "GET", api + "/v1/items", proxy=proxy)["status"] == 200
+    assert send(plain["token"], "GET", api + "/v1/items", proxy=proxy)["status"] == 200
+
+def test_unknown_task_refused(env):
+    b, api, proxy, *_ = env
+    with pytest.raises(GrantError, match="unknown task 'nope'"): grant(b, api, task_id="nope")
+    with pytest.raises(GrantError, match="unknown task"): _end(b, "nope")
+    with pytest.raises(GrantError, match="destructorOk"): b.task_end({"task_id": "nope", "timestamp": "t"})
+    with pytest.raises(GrantError, match="unknown lifecycle event"): b.task_event({"event": "task_pause", "task_id": "x"})
+
+def test_task_id_is_covered_by_the_request_signature(env):
+    b, api, *_ = env
+    _open(b, "a"); _open(b, "b")
+    url = api + "/v1/items"
+    auth = AGENT.sign("request", request_fields("demo-api", "GET", url, b"", ["read"], 0.5, 60, None, "a"))
+    with pytest.raises(GrantError, match="bad agent signature"):   # re-bound to another task after signing
+        b.request("demo-agent", "demo-api", "GET", url, scope=["read"], cap=0.5, auth=auth, task_id="b")
+    with pytest.raises(GrantError, match="bad agent signature"):   # task binding stripped after signing
+        b.request("demo-agent", "demo-api", "GET", url, scope=["read"], cap=0.5, auth=auth)
+
+def test_task_end_receipt_lists_revoked_grants_and_is_signed(env):
+    b, api, proxy, _, home = env
+    _open(b, "task-r", "2026-01-01T00:00:00Z")
+    used = grant(b, api, task_id="task-r")
+    assert send(used["token"], "GET", api + "/v1/items", proxy=proxy)["status"] == 200
+    left = [grant(b, api, task_id="task-r")["grant_id"] for _ in range(2)]
+    end = b.task_end({"task_id": "task-r", "timestamp": "2026-01-01T00:07:00Z", "destructorOk": False})
+    recs = [json.loads(l) for l in (home / "receipts.jsonl").read_text().splitlines()]
+    te = [x for x in recs if x["event"] == "task_end"]
+    assert len(te) == 1
+    assert te[0]["data"] == {"task_id": "task-r", "timestamp": "2026-01-01T00:07:00Z", "destructorOk": False,
+                             "revoked_grant_ids": left}
+    assert used["grant_id"] not in te[0]["data"]["revoked_grant_ids"]      # settled grants are not "revoked"
+    assert end["receipt_ref"].endswith(te[0]["hash"][:16])
+    opened = [x for x in recs if x["event"] == "task_open"][0]["data"]
+    assert opened == {"task_id": "task-r", "timestamp": "2026-01-01T00:00:00Z"}
+    assert all(b.list()[i]["status"] == "revoked" for i in (1, 2))
+    ok, n, _ = b.log.verify(); assert ok and n == len(recs)
+
+def test_refusal_is_in_place_before_runner_teardown(env):
+    """Runner order: task_end (refuse) THEN kill the process group. A task process that is still alive
+    between the two steps must already be refused."""
+    import subprocess, signal
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "examples"))
+    import task_runner
+    b, api, proxy, *_ = env
+    seen = {}
+    real_killpg = os.killpg
+    def killpg(pid, sig):
+        # at teardown time the broker must already refuse this task
+        seen["refused"] = b._task_refusal("task-k")
+        try: grant(b, api, task_id="task-k")
+        except GrantError as e: seen["mint"] = str(e)
+        real_killpg(pid, sig)
+    task_runner.os.killpg = killpg
+    try:
+        end = task_runner.run(b, "task-k", [sys.executable, "-c", "import time; time.sleep(30)"], timeout=0.2)
+    finally:
+        task_runner.os.killpg = real_killpg
+    assert "has ended" in seen["refused"] and "has ended" in seen["mint"]
+    assert end["state"] == "ended"
+
+def test_example_task_events_apply_cleanly(env):
+    b, api, *_ = env
+    path = os.path.join(os.path.dirname(__file__), "..", "examples", "task_events.jsonl")
+    evs = [json.loads(l) for l in open(path) if l.strip()]
+    assert [e["event"] for e in evs] == ["task_open", "task_end"]
+    assert b.task_event(evs[0])["state"] == "open"
+    g = grant(b, api, task_id=evs[0]["task_id"])
+    out = b.task_event(evs[1])
+    assert out["revoked_grant_ids"] == [g["grant_id"]]
+
+def test_task_cli_open_end_and_event_file(tmp_path, capsys):
+    from mintcall.cli import main
+    h = ["--home", str(tmp_path)]
+    assert main(h + ["init"]) == 0
+    assert main(h + ["task", "open", "t-cli", "--timestamp", "2026-01-01T00:00:00Z"]) == 0
+    assert main(h + ["task", "end", "t-cli", "--destructor-ok"]) == 0
+    assert '"state": "ended"' in capsys.readouterr().out
+    assert main(h + ["task", "end", "t-cli", "--destructor-ok"]) == 2
+    ev = tmp_path / "ev.json"; ev.write_text(json.dumps({"event": "task_open", "task_id": "t2", "timestamp": "x"}))
+    assert main(h + ["task", "event", str(ev)]) == 0

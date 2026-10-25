@@ -26,7 +26,7 @@ The demo shows: key stored encrypted → agent gets its own Ed25519 key → sign
 |---|---|---|
 | Vault | `mintcall/vault.py` | scrypt + Fernet encrypted file (`MINTCALL_PASSPHRASE`), or `--keyring` (OS keyring, `pip install .[keyring]`). Each credential is pinned to one recipient origin. |
 | Policy | `~/.mintcall/policy.json` | Rules match agent, credential, method, path glob, scopes, max cap, budget, max TTL and decision (`auto` / `ask`). A request that matches no rule is denied. |
-| Grant | `mintcall/broker.py` | Fields: grant_id, agent_id, recipient, request_hash, intent, scope, cap, not_before / expires_at, nonce, status, receipt_ref. Status runs minted → claimed → settled, or ends as failed, expired or revoked. Only a hash of the token is stored. |
+| Grant | `mintcall/broker.py` | Fields: grant_id, agent_id, recipient, request_hash, intent, scope, cap, optional task_id, not_before / expires_at, nonce, status, receipt_ref. Status runs minted → claimed → settled, or ends as failed, expired or revoked. Only a hash of the token is stored. |
 | Claim | `Broker.claim` | One `BEGIN IMMEDIATE` transaction checks the token, status, window, recipient and request hash, then **re-checks the cap against spend** before claiming. A grant can be claimed only once. |
 | Settle | `Broker.settle` | Spend is committed only on an upstream 2xx response. A failed call is recorded as `fail_no_charge`. |
 | Proxy | `mintcall/proxy.py` | Listens on loopback only. The client sends `X-Mintcall-Grant` plus `X-Mintcall-Target`, or uses an absolute URI. The proxy strips any client `Authorization` header, injects the key and redacts the key if it is echoed back. |
@@ -47,15 +47,28 @@ mintcall request --agent A --agent-key ./A.key --credential NAME --method GET --
 mintcall approve GRANT_ID      mintcall revoke GRANT_ID | --agent A
 mintcall list [--status minted] mintcall sweep   mintcall verify-log
 mintcall proxy --port 8787 [--key-ttl 30]
+mintcall task open TASK_ID      mintcall task end TASK_ID --destructor-ok|--destructor-failed      mintcall task event FILE.json
 mintcall sign-claim --agent-key ./A.key --token TOKEN --url URL [--method GET]   # prints X-Mintcall-{Agent,Ts,Nonce,Sig} headers
 ```
 Agents that call the proxy directly send `X-Mintcall-Grant` and `X-Mintcall-Target`, plus the four signature headers (`mintcall.client.send(..., signer=key)` does this for you).
+
+## Task-id scoping
+A grant can be bound to a task: pass `task_id` to `request` (`--task-id` on the CLI). The task_id is part of the signed request, so it can't be swapped or stripped after signing. The runner sends two lifecycle events (our own schema; see `examples/task_events.jsonl`):
+
+```
+task_open {"task_id": "...", "timestamp": "..."}
+task_end  {"task_id": "...", "timestamp": "...", "destructorOk": true|false}
+```
+
+- A grant bound to a task can be minted and used only while that task is open. An unknown task is refused, and so is a task_id that has already ended (task ids are single-use).
+- When `task_end` arrives, the broker first marks the task ended and revokes its unused grants (minted or pending approval) in one transaction. From then on, any mint or use for that task gets a 403 `task '...' has ended`. It then writes a signed `task_end` receipt with `task_id`, `timestamp`, `destructorOk` and `revoked_grant_ids`.
+- **Teardown belongs to the runner, not the broker.** The broker never kills processes. The runner calls `task_end` first and kills the task's process group only after that returns, so a process still alive during teardown is already refused. `examples/task_runner.py` shows this order. A call that was already claimed (in flight) when `task_end` arrived is not interrupted, and its settle is recorded as usual. `destructorOk` is recorded as reported; revocation happens whatever its value.
 
 ## Wrapping an MCP server
 See `examples/mcp_tool_wrapper.py` and `examples/mcp.json`. The tool body calls `call_via_proxy(...)` where it used to call `requests.get(url, headers={key})`. The MCP process never opens the vault and needs no passphrase. If the `mcp` SDK is installed, it runs as a FastMCP server (`--serve`).
 
 ## Tests
-`pytest -q tests` (36 tests) covers reuse, replay to a different path, recipient or body, expiry, forged tokens, a concurrent claim race (32 threads, 1 success), revoke, approval flow, policy denials, cap re-check at use, no charge on failure, tamper detection in the receipt log, and vault encryption. It also covers agent auth: unsigned requests, wrong keys, an agent impersonating another, params or intent changed after signing, nonce replay, stale timestamps, unsigned or mis-signed claims, claim-signature replay, and a stolen grant used by another agent. Plus burn vs N-strikes, key-cache hit/expiry/revoke/shutdown, the notify command and webhook, and the `agent add` CLI. Redirects: 301/302/303 and 307/308 (GET and POST) to another origin are never followed by the proxy or client, and the injected key never reaches the other origin.
+`pytest -q tests` (44 tests) covers reuse, replay to a different path, recipient or body, expiry, forged tokens, a concurrent claim race (32 threads, 1 success), revoke, approval flow, policy denials, cap re-check at use, no charge on failure, tamper detection in the receipt log, and vault encryption. It also covers agent auth: unsigned requests, wrong keys, an agent impersonating another, params or intent changed after signing, nonce replay, stale timestamps, unsigned or mis-signed claims, claim-signature replay, and a stolen grant used by another agent. Plus burn vs N-strikes, key-cache hit/expiry/revoke/shutdown, the notify command and webhook, and the `agent add` CLI. Redirects: 301/302/303 and 307/308 (GET and POST) to another origin are never followed by the proxy or client, and the injected key never reaches the other origin. Task scoping: minting under an open task, refusal after `task_end` and for an unknown task, task_id bound into the signature, the `task_end` receipt contents, and refusal being in place before the runner kills the process group.
 
 ## Latency (`bench/latency.py`, local, fake upstream, real scrypt vault)
 | | median | p95 |
@@ -89,6 +102,7 @@ Almost all of the v0 cost was the scrypt KDF (n=2^15) on each decrypt. The first
 | Overspend through pre-minted grants | The cap is re-checked against spend in the claim transaction. Spend is only charged on 2xx. |
 | Key echoed back by the upstream | The proxy redacts the key from response bodies. |
 | Upstream redirects the call to another origin | The proxy never follows redirects (fixed in `dcc7fa7`; see CHANGELOG). The 3xx goes back to the agent with `X-Mintcall-Redirect: refused`, and reaching the new URL needs a fresh grant. |
+| A task process outlives its task | Grants bound to a task_id are refused (403) from `task_end` onward; the runner kills the process group only after that. |
 | Silent misuse | Hash-chained, Ed25519-signed receipts, and a notify hook on approvals. |
 
 **What secretless provides** (opena2a-org/secretless-ai, commit `a18cd3da`): `broker start` serves `POST /grant` from a grant file. Agents are identified by **ATX** issuer-signed (Ed25519) identity assertions, with trust, revocation and bindings in that file. The broker exchanges for a **short-lived, scoped token** through **RFC 8693 token exchange** against a configured identity provider, and **the broker makes the downstream call itself**, so the agent never holds the long-lived secret. Decisions go to an audit log, and an optional AIM check can deny unverified agents. This is a solid identity-first design. If you already run an IdP that supports token exchange and want standards-based scoped tokens, it covers that well, and mintcall does not try to replace it.

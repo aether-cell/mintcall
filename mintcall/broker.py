@@ -19,7 +19,11 @@ CREATE TABLE IF NOT EXISTS grants(
 CREATE TABLE IF NOT EXISTS spend(agent_id TEXT, credential TEXT, amount REAL, grant_id TEXT, ts REAL);
 CREATE TABLE IF NOT EXISTS nonces(nonce TEXT PRIMARY KEY, agent_id TEXT, ts REAL);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v INTEGER);
+CREATE TABLE IF NOT EXISTS tasks(task_id TEXT PRIMARY KEY, state TEXT NOT NULL, opened_at TEXT,
+  ended_at TEXT, destructor_ok INTEGER, end_receipt TEXT);
 """
+
+TASK_ID_MAX = 128
 
 def _th(t): return hashlib.sha256(t.encode()).hexdigest()
 
@@ -34,10 +38,13 @@ def intent_hash(intent):
     approves is the `why` the agent signed."""
     return hashlib.sha256(json.dumps(intent or {}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
-def request_fields(credential, method, url, body, scope, cap, ttl, intent=None):
-    """What an agent signs when it asks for a grant (including the intent shown at approval)."""
-    return {"credential": credential, "method": method.upper(), "url": url, "body_sha256": body_hash(body),
-            "scope": sorted(scope), "cap": float(cap), "ttl": int(ttl), "intent_sha256": intent_hash(intent)}
+def request_fields(credential, method, url, body, scope, cap, ttl, intent=None, task_id=None):
+    """What an agent signs when it asks for a grant (including the intent shown at approval and, when the
+    grant is bound to a task, the task_id, so a signed request cannot be re-bound to another task)."""
+    f = {"credential": credential, "method": method.upper(), "url": url, "body_sha256": body_hash(body),
+         "scope": sorted(scope), "cap": float(cap), "ttl": int(ttl), "intent_sha256": intent_hash(intent)}
+    if task_id is not None: f["task_id"] = task_id
+    return f
 
 def intent_mismatch(intent, method, url, cap):
     """If the structured intent states the call (method, url, cap), it must state the call actually
@@ -63,6 +70,8 @@ class Broker:
         self.db.executescript(SCHEMA)
         try: self.db.execute("ALTER TABLE grants ADD COLUMN strikes INTEGER DEFAULT 0")
         except sqlite3.OperationalError: pass  # already migrated
+        try: self.db.execute("ALTER TABLE grants ADD COLUMN task_id TEXT")
+        except sqlite3.OperationalError: pass  # already migrated
         self.agents = agents or AgentRegistry(self.home / "agents.json")
         self.require_auth = require_auth
         self.notify_threads = []
@@ -75,15 +84,20 @@ class Broker:
     # 1-3: request, policy check, mint
     @_locked
     def request(self, agent_id, credential, method, url, body=b"", scope=("read",), cap=0.0,
-                ttl=60, intent=None, auth=None):
+                ttl=60, intent=None, auth=None, task_id=None):
         if self.require_auth:
             try:
-                signer = self.agents.verify("request", request_fields(credential, method, url, body, scope, cap, ttl, intent), auth)
+                signer = self.agents.verify("request", request_fields(credential, method, url, body, scope, cap, ttl, intent, task_id), auth)
                 if signer != agent_id: raise AuthError("signature is for a different agent")
                 self._use_nonce(auth)
             except AuthError as e:
                 self.log.append("auth_fail", op="request", claimed_agent=agent_id, reason=str(e))
                 raise GrantError(f"auth: {e}")
+        if task_id is not None:
+            bad_task = self._task_refusal(task_id)
+            if bad_task:
+                self.log.append("deny", agent_id=agent_id, url=url, task_id=task_id, reason=bad_task)
+                raise GrantError(bad_task)
         if self.vault is not None:
             cred = self.vault.get(credential)
             if recipient_of(url) != cred["recipient"]:
@@ -97,7 +111,8 @@ class Broker:
                                                       urlsplit(url).path or "/", list(scope), cap, ttl)
         rh = request_hash(method, url, body)
         base = dict(agent_id=agent_id, credential=credential, method=method.upper(), url=url,
-                    request_hash=rh, scope=list(scope), cap=cap, ttl=ttl, intent=intent or {})
+                    request_hash=rh, scope=list(scope), cap=cap, ttl=ttl, intent=intent or {},
+                    **({"task_id": task_id} if task_id is not None else {}))
         if decision == "deny":
             self.log.append("deny", reason=reason, **base)
             raise GrantError(f"denied: {reason}")
@@ -107,16 +122,85 @@ class Broker:
         status = "minted" if decision == "auto" else "pending_approval"
         ref = self.log.append("mint" if status == "minted" else "approval_requested",
                               grant_id=gid, decision=decision, reason=reason, **base)
-        self.db.execute("INSERT INTO grants VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0)",
+        self.db.execute("INSERT INTO grants(grant_id,agent_id,credential,recipient,request_hash,method,url,intent,scope,"
+                        "cap,budget,not_before,expires_at,nonce,token_hash,status,receipt_ref,created,strikes,task_id) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?)",
             (gid, agent_id, credential, recipient_of(url), rh, method.upper(), url,
              json.dumps(intent or {}), json.dumps(list(scope)), cap, rule.get("budget", cap),
-             now, now + ttl, secrets.token_hex(16), _th(token), status, ref, now))
+             now, now + ttl, secrets.token_hex(16), _th(token), status, ref, now, task_id))
         if status == "pending_approval":
             self.notify_threads = notify.fire(self.policy.data.get("notify"), "pending_approval",
                 {"grant_id": gid, "agent_id": agent_id, "credential": credential, "method": method.upper(),
                  "url": url, "cap": cap, "expires_at": now + ttl, "why": (intent or {}).get("why", "")})
         return {"grant_id": gid, "token": f"{gid}.{token}", "status": status,
-                "expires_at": now + ttl, "request_hash": rh, "receipt_ref": ref}
+                "expires_at": now + ttl, "request_hash": rh, "receipt_ref": ref, "task_id": task_id}
+
+    # ---- task lifecycle (events come from the runner; teardown itself is the runner's job) ----
+    def _task_refusal(self, task_id):
+        """None if the task is open, else the reason a grant bound to it must be refused."""
+        row = self.db.execute("SELECT state FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        if not row: return f"unknown task {task_id!r} (no task_open received)"
+        if row[0] != "open": return f"task {task_id!r} has ended (task_end received): no new grants or uses"
+        return None
+
+    @staticmethod
+    def _check_event(ev, kind, required):
+        if not isinstance(ev, dict): raise GrantError(f"{kind}: event must be a JSON object")
+        missing = [k for k in required if k not in ev]
+        if missing: raise GrantError(f"{kind}: missing field(s) {', '.join(missing)}")
+        tid = ev["task_id"]
+        if not isinstance(tid, str) or not tid or len(tid) > TASK_ID_MAX:
+            raise GrantError(f"{kind}: task_id must be a non-empty string of at most {TASK_ID_MAX} chars")
+        if "event" in ev and ev["event"] != kind: raise GrantError(f"{kind}: event field says {ev['event']!r}")
+
+    @_locked
+    def task_open(self, event):
+        """event = {"task_id": str, "timestamp": str}. Grants may then be bound to task_id.
+        A task_id is single-use: once ended it cannot be reopened."""
+        self._check_event(event, "task_open", ("task_id", "timestamp"))
+        tid = event["task_id"]
+        try:
+            self.db.execute("INSERT INTO tasks(task_id,state,opened_at) VALUES(?, 'open', ?)", (tid, str(event["timestamp"])))
+        except sqlite3.IntegrityError:
+            raise GrantError(f"task_open: task {tid!r} already exists (task ids are single-use)")
+        ref = self.log.append("task_open", task_id=tid, timestamp=str(event["timestamp"]))
+        return {"task_id": tid, "state": "open", "receipt_ref": ref}
+
+    @_locked
+    def task_end(self, event):
+        """event = {"task_id": str, "timestamp": str, "destructorOk": bool}.
+        In ONE transaction: mark the task ended (so every later mint or claim bound to it is refused with
+        a task-ended reason) and revoke its unused grants (minted / pending_approval). Then write a signed
+        task_end receipt listing the revoked grant ids. Only after this returns should the runner kill the
+        task's process group; the broker never kills anything. A grant already claimed (call in flight)
+        is not interrupted; its settle is recorded as usual."""
+        self._check_event(event, "task_end", ("task_id", "timestamp", "destructorOk"))
+        if not isinstance(event["destructorOk"], bool): raise GrantError("task_end: destructorOk must be true or false")
+        tid, ts, dok = event["task_id"], str(event["timestamp"]), event["destructorOk"]
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.db.execute("SELECT state FROM tasks WHERE task_id=?", (tid,)).fetchone()
+            if not row: raise GrantError(f"task_end: unknown task {tid!r}")
+            if row[0] != "open": raise GrantError(f"task_end: task {tid!r} already ended")
+            self.db.execute("UPDATE tasks SET state='ended', ended_at=?, destructor_ok=? WHERE task_id=?", (ts, int(dok), tid))
+            ids = [r[0] for r in self.db.execute(
+                "SELECT grant_id FROM grants WHERE task_id=? AND status IN ('minted','pending_approval') ORDER BY created", (tid,))]
+            self.db.execute("UPDATE grants SET status='revoked' WHERE task_id=? AND status IN ('minted','pending_approval')", (tid,))
+            self.db.execute("INSERT INTO meta VALUES('revoke_epoch',1) ON CONFLICT(k) DO UPDATE SET v=v+1")
+            self.db.execute("COMMIT")
+        except Exception:
+            if self.db.in_transaction: self.db.execute("ROLLBACK")
+            raise
+        ref = self.log.append("task_end", task_id=tid, timestamp=ts, destructorOk=dok, revoked_grant_ids=ids)
+        self.db.execute("UPDATE tasks SET end_receipt=? WHERE task_id=?", (ref, tid))
+        return {"task_id": tid, "state": "ended", "revoked_grant_ids": ids, "receipt_ref": ref}
+
+    def task_event(self, event):
+        """Dispatch a lifecycle event carrying "event": "task_open" | "task_end"."""
+        kind = event.get("event") if isinstance(event, dict) else None
+        if kind == "task_open": return self.task_open(event)
+        if kind == "task_end": return self.task_end(event)
+        raise GrantError(f"unknown lifecycle event {kind!r} (expected task_open or task_end)")
 
     def _use_nonce(self, auth):
         now = self.now()
@@ -167,11 +251,14 @@ class Broker:
                 raise self._refuse(gid, f"auth: {e}")
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            row = self.db.execute("SELECT agent_id,credential,recipient,request_hash,cap,budget,not_before,expires_at,token_hash,status,strikes "
+            row = self.db.execute("SELECT agent_id,credential,recipient,request_hash,cap,budget,not_before,expires_at,token_hash,status,strikes,task_id "
                                   "FROM grants WHERE grant_id=?", (gid,)).fetchone()
             if not row: raise self._refuse(gid, "unknown grant")
-            agent, cred, recip, grh, cap, budget, nb, exp, th, status, strikes = row
+            agent, cred, recip, grh, cap, budget, nb, exp, th, status, strikes, task_id = row
             if not hmac.compare_digest(th, _th(tok)): raise self._refuse(gid, "bad token")
+            if task_id is not None:   # checked before status, so a grant revoked by task_end says why
+                bad_task = self._task_refusal(task_id)
+                if bad_task: raise self._refuse(gid, bad_task)
             if status != "minted": raise self._refuse(gid, f"grant is {status} (reuse/replay refused)")
             if now >= exp:
                 self.db.execute("UPDATE grants SET status='expired' WHERE grant_id=?", (gid,))
