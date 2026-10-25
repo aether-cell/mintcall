@@ -29,5 +29,5 @@ def send(token, method, url, body=b"", proxy="http://127.0.0.1:8787", headers=No
     if auth: h.update(auth_headers(auth))
     req = urllib.request.Request(proxy + "/", data=body or None, method=method, headers=h)
     try:
-        with _OPENER.open(req, timeout=30) as r: return {"status": r.status, "body": r.read().decode()}
-    except urllib.error.HTTPError as e: return {"status": e.code, "body": e.read().decode()}
+        with _OPENER.open(req, timeout=30) as r: return {"status": r.status, "body": r.read().decode(), "headers": dict(r.headers.items())}
+    except urllib.error.HTTPError as e: return {"status": e.code, "body": e.read().decode(), "headers": dict(e.headers.items())}

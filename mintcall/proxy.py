@@ -60,6 +60,7 @@ def make_handler(broker, keys):
             # digest of the body exactly as the agent receives it, so the receipt and the agent's own copy can be compared
             broker.settle(c, ok=ok, status_code=code, response_sha256=hashlib.sha256(data).hexdigest())
             keep = [(k, v) for k, v in rh if k.lower() not in HOP | {"content-length"}]
+            if 300 <= code < 400: keep.append(("X-Mintcall-Redirect", "refused"))  # not followed; new URL needs a new grant
             self._reply(code, data, keep + [("X-Mintcall-Settled", "1" if ok else "0")])
         do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_CONNECT = _go
     return H

@@ -342,3 +342,37 @@ def test_proxy_never_follows_redirects_with_the_injected_key(env):
     assert seen == []                       # neither the proxy (with the key) nor the client (with the grant) followed it
     assert r["status"] == 307               # the agent sees the redirect and needs a fresh grant for the new URL
     assert b.list()[0]["status"] == "failed"  # a 3xx is not a successful call, so nothing is charged
+
+def _evil_origin():
+    """A second origin that records every request it receives (method, Authorization, grant header)."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    seen = []
+    class Evil(BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def _go(self):
+            n = int(self.headers.get("Content-Length") or 0); n and self.rfile.read(n)
+            seen.append((self.command, self.headers.get("Authorization"), self.headers.get("X-Mintcall-Grant")))
+            self.send_response(200); self.send_header("Content-Length", "2"); self.end_headers(); self.wfile.write(b"ok")
+        do_GET = do_POST = do_PUT = _go
+    ev = ThreadingHTTPServer(("127.0.0.1", 0), Evil); threading.Thread(target=ev.serve_forever, daemon=True).start()
+    return ev, seen
+
+@pytest.mark.parametrize("code,method", [(307, "GET"), (307, "POST"), (308, "GET"), (308, "POST"),
+                                         (301, "GET"), (302, "GET"), (303, "POST")])
+def test_cross_origin_redirect_refused_and_key_never_sent(env, code, method):
+    """307/308 keep method and body, so a followed redirect would replay the call with the injected key to
+    the other origin. Neither proxy nor client may follow any 3xx; the redirect is refused, not charged."""
+    b, api, proxy, *_ = env
+    ev, seen = _evil_origin()
+    path = f"/v1/redirect{code}?to=http://127.0.0.1:{ev.server_port}/steal"
+    body = b'{"amount":1}' if method == "POST" else b""
+    g = grant(b, api, path, method, body, cap=0.5)
+    if g["status"] == "pending_approval": b.approve(g["grant_id"])
+    r = send(g["token"], method, api + path, body, proxy=proxy)
+    ev.shutdown()
+    assert seen == []                                   # nothing reached the other origin: no key, no grant
+    assert r["status"] == code
+    assert r["headers"].get("X-Mintcall-Redirect") == "refused"
+    assert r["headers"].get("X-Mintcall-Settled") == "0"
+    assert KEY not in r["body"] and KEY not in json.dumps(r["headers"])
+    assert b.list()[0]["status"] == "failed" and b.spent("demo-agent", "demo-api") == 0
