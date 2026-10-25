@@ -1,7 +1,7 @@
 """Local HTTP forward proxy. The agent sends its call (absolute URL in the request line, or
 X-Mintcall-Target) plus X-Mintcall-Grant. The proxy claims the grant against the exact request,
 injects the real key from the vault, forwards, and settles. The key never reaches the agent."""
-import threading, urllib.request, urllib.error
+import hashlib, threading, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from .broker import GrantError
 from .agents import auth_from_headers
@@ -48,9 +48,10 @@ def make_handler(broker, keys):
                 broker.settle(c, ok=False, status_code=None)
                 return self._reply(502, f"upstream error: {e}".encode())
             ok = 200 <= code < 300
-            broker.settle(c, ok=ok, status_code=code)
             secret = cred["secret"].encode()
             data = data.replace(secret, b"[REDACTED]")  # never echo the key back
+            # digest of the body exactly as the agent receives it, so the receipt and the agent's own copy can be compared
+            broker.settle(c, ok=ok, status_code=code, response_sha256=hashlib.sha256(data).hexdigest())
             keep = [(k, v) for k, v in rh if k.lower() not in HOP | {"content-length"}]
             self._reply(code, data, keep + [("X-Mintcall-Settled", "1" if ok else "0")])
         do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_CONNECT = _go

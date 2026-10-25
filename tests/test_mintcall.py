@@ -315,3 +315,13 @@ def test_agent_cli_add_and_signed_request(tmp_path, monkeypatch):
     other = tmp_path / "other.key"; AgentKey.generate("demo-agent").save(other)
     assert main(h + ["request", "--agent", "demo-agent", "--agent-key", str(other), "--credential", "demo-api",
                      "--url", "http://127.0.0.1:9/v1/items", "--cap", "0.5"]) == 2
+
+def test_settle_receipt_carries_digest_of_body_agent_received(env):
+    import hashlib
+    b, api, proxy, _, home = env
+    g = grant(b, api)
+    r = send(g["token"], "GET", api + "/v1/items", proxy=proxy)
+    assert r["status"] == 200
+    recs = [json.loads(l) for l in (home / "receipts.jsonl").read_text().splitlines()]
+    st = [x for x in recs if x["event"] == "settle"][-1]
+    assert st["data"]["response_sha256"] == hashlib.sha256(r["body"].encode()).hexdigest()

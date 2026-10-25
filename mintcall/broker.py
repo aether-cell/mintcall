@@ -208,7 +208,7 @@ class Broker:
 
     # settle only on success
     @_locked
-    def settle(self, claim, ok, status_code=None, cost=None):
+    def settle(self, claim, ok, status_code=None, cost=None, response_sha256=None):
         gid = claim["grant_id"]
         if ok:
             amt = claim["cap"] if cost is None else min(cost, claim["cap"])
@@ -217,7 +217,8 @@ class Broker:
         else:
             amt = 0.0
             self.db.execute("UPDATE grants SET status='failed' WHERE grant_id=?", (gid,))
-        self.log.append("settle" if ok else "fail_no_charge", grant_id=gid, upstream_status=status_code, charged=amt)
+        extra = {"response_sha256": response_sha256} if response_sha256 else {}
+        self.log.append("settle" if ok else "fail_no_charge", grant_id=gid, upstream_status=status_code, charged=amt, **extra)
 
     @_locked
     def expire_sweep(self):

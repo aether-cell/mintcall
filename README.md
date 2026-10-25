@@ -97,6 +97,7 @@ Almost all of the v0 cost was the scrypt KDF (n=2^15) on each decrypt. The first
 - **Single-use claim-once:** one atomic claim, and a second use is refused even within the TTL.
 - **Cap re-checked at use:** spend is re-validated inside the claim transaction, so a stack of grants minted ahead of time cannot overrun the budget.
 - **Settle-on-success:** spend is committed only on an upstream 2xx response. Failures are recorded as `fail_no_charge`.
+- **Response digest:** every settle or `fail_no_charge` receipt carries `response_sha256`, the sha256 of the response body exactly as the agent received it (after key redaction). If the agent's own note about a call disagrees with what came back, the digest shows it.
 - **No identity provider needed:** it works with plain API keys (`X-Api-Key`, `Bearer`) for providers that offer no token exchange at all. Agent identity is a local Ed25519 key.
 
 What mintcall does **not** have that secretless does: standards-based federated identity (ATX/RFC 8693), revocation lists distributed by issuers, and upstream tokens that are actually down-scoped. A mintcall grant is scoped by local policy, but the injected key is still the full-power key.
