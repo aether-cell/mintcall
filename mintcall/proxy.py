@@ -10,6 +10,13 @@ from .keycache import CachedVault
 HOP = {"connection","keep-alive","proxy-connection","proxy-authorization","te","trailers","transfer-encoding","upgrade","host",
        "x-mintcall-grant","x-mintcall-target","x-mintcall-agent","x-mintcall-ts","x-mintcall-nonce","x-mintcall-sig","authorization","content-length","accept-encoding"}
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect: the grant is bound to one exact URL, and urllib would otherwise copy the
+    injected key header to whatever origin the Location points at. The 3xx goes back to the agent instead."""
+    def redirect_request(self, *a, **kw): return None
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
 def make_handler(broker, keys):
     state = {"epoch": broker.revoke_epoch()}
     def get_key(name):
@@ -40,7 +47,7 @@ def make_handler(broker, keys):
             hdrs[cred["header"]] = cred["format"].format(secret=cred["secret"])
             req = urllib.request.Request(url, data=body or None, method=self.command, headers=hdrs)
             try:
-                with urllib.request.urlopen(req, timeout=30) as r:
+                with _OPENER.open(req, timeout=30) as r:
                     data, code, rh = r.read(), r.status, r.getheaders()
             except urllib.error.HTTPError as e:
                 data, code, rh = e.read(), e.code, list(e.headers.items())

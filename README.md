@@ -88,6 +88,7 @@ Almost all of the v0 cost was the scrypt KDF (n=2^15) on each decrypt. The first
 | Signed message replayed | `ts` window plus a single-use nonce. |
 | Overspend through pre-minted grants | The cap is re-checked against spend in the claim transaction. Spend is only charged on 2xx. |
 | Key echoed back by the upstream | The proxy redacts the key from response bodies. |
+| Upstream redirects the call to another origin | The proxy never follows redirects. The 3xx goes back to the agent, and reaching the new URL needs a fresh grant. |
 | Silent misuse | Hash-chained, Ed25519-signed receipts, and a notify hook on approvals. |
 
 **What secretless provides** (opena2a-org/secretless-ai, commit `a18cd3da`): `broker start` serves `POST /grant` from a grant file. Agents are identified by **ATX** issuer-signed (Ed25519) identity assertions, with trust, revocation and bindings in that file. The broker exchanges for a **short-lived, scoped token** through **RFC 8693 token exchange** against a configured identity provider, and **the broker makes the downstream call itself**, so the agent never holds the long-lived secret. Decisions go to an audit log, and an optional AIM check can deny unverified agents. This is a solid identity-first design. If you already run an IdP that supports token exchange and want standards-based scoped tokens, it covers that well, and mintcall does not try to replace it.

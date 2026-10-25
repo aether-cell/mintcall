@@ -9,6 +9,9 @@ class H(BaseHTTPRequestHandler):
     def _go(self):
         n = int(self.headers.get("Content-Length") or 0); body = self.rfile.read(n) if n else b""
         ok = self.headers.get("Authorization") == EXPECTED
+        if self.path.startswith("/v1/redirect?to="):       # simulates an upstream that bounces the call elsewhere
+            self.send_response(307); self.send_header("Location", self.path.split("to=", 1)[1])
+            self.send_header("Content-Length", "0"); self.end_headers(); return
         if self.path.startswith("/v1/fail"): code, out = 500, {"error": "upstream broke"}
         elif not ok: code, out = 401, {"error": "missing/invalid key"}
         else: code, out = 200, {"ok": True, "path": self.path, "echo": body.decode(), "authed": True}

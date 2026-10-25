@@ -4,6 +4,13 @@ import json, urllib.request, urllib.error
 from .agents import AgentKey, auth_headers
 from .broker import request_fields, claim_fields
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Don't follow redirects: they would carry the grant token and claim signature to another origin.
+    The 3xx is returned to the caller; the new URL needs its own grant."""
+    def redirect_request(self, *a, **kw): return None
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
 def request_grant(broker, signer, credential, method, url, body=b"", scope=("read",), cap=0.0, ttl=60, intent=None):
     auth = signer.sign("request", request_fields(credential, method, url, body, scope, cap, ttl, intent))
     return broker.request(signer.agent_id, credential, method, url, body, scope=scope, cap=cap, ttl=ttl, intent=intent, auth=auth)
@@ -22,5 +29,5 @@ def send(token, method, url, body=b"", proxy="http://127.0.0.1:8787", headers=No
     if auth: h.update(auth_headers(auth))
     req = urllib.request.Request(proxy + "/", data=body or None, method=method, headers=h)
     try:
-        with urllib.request.urlopen(req, timeout=30) as r: return {"status": r.status, "body": r.read().decode()}
+        with _OPENER.open(req, timeout=30) as r: return {"status": r.status, "body": r.read().decode()}
     except urllib.error.HTTPError as e: return {"status": e.code, "body": e.read().decode()}

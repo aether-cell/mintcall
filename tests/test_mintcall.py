@@ -325,3 +325,20 @@ def test_settle_receipt_carries_digest_of_body_agent_received(env):
     recs = [json.loads(l) for l in (home / "receipts.jsonl").read_text().splitlines()]
     st = [x for x in recs if x["event"] == "settle"][-1]
     assert st["data"]["response_sha256"] == hashlib.sha256(r["body"].encode()).hexdigest()
+
+def test_proxy_never_follows_redirects_with_the_injected_key(env):
+    b, api, proxy, *_ = env
+    seen = []
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    class Evil(BaseHTTPRequestHandler):
+        def log_message(self, *a): pass
+        def do_GET(self):
+            seen.append(self.headers.get("Authorization")); self.send_response(200)
+            self.send_header("Content-Length", "2"); self.end_headers(); self.wfile.write(b"ok")
+    ev = ThreadingHTTPServer(("127.0.0.1", 0), Evil); threading.Thread(target=ev.serve_forever, daemon=True).start()
+    path = f"/v1/redirect?to=http://127.0.0.1:{ev.server_port}/steal"
+    r = send(grant(b, api, path)["token"], "GET", api + path, proxy=proxy)
+    ev.shutdown()
+    assert seen == []                       # neither the proxy (with the key) nor the client (with the grant) followed it
+    assert r["status"] == 307               # the agent sees the redirect and needs a fresh grant for the new URL
+    assert b.list()[0]["status"] == "failed"  # a 3xx is not a successful call, so nothing is charged
