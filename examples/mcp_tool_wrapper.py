@@ -36,4 +36,4 @@ except ImportError:
 
 if __name__ == "__main__":
     if mcp and "--serve" in sys.argv: mcp.run()
-    else: print(get_forecast(sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else "Prague"))
+    else: print(get_forecast(sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else "London"))
