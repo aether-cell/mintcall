@@ -47,28 +47,30 @@ mintcall request --agent A --agent-key ./A.key --credential NAME --method GET --
 mintcall approve GRANT_ID      mintcall revoke GRANT_ID | --agent A
 mintcall list [--status minted] mintcall sweep   mintcall verify-log
 mintcall proxy --port 8787 [--key-ttl 30]
-mintcall task open TASK_ID      mintcall task end TASK_ID --destructor-ok|--destructor-failed      mintcall task event FILE.json
+mintcall task open TASK_ID      mintcall task end TASK_ID [--transition done|cancelled|suspended]
+mintcall task destroyed TASK_ID --destructor-ok|--destructor-failed      mintcall task stuck      mintcall task event FILE.json
 mintcall sign-claim --agent-key ./A.key --token TOKEN --url URL [--method GET]   # prints X-Mintcall-{Agent,Ts,Nonce,Sig} headers
 ```
 Agents that call the proxy directly send `X-Mintcall-Grant` and `X-Mintcall-Target`, plus the four signature headers (`mintcall.client.send(..., signer=key)` does this for you).
 
 ## Task-id scoping
-A grant can be bound to a task: pass `task_id` to `request` (`--task-id` on the CLI). The task_id is part of the signed request, so it can't be swapped or stripped after signing. The runner sends two lifecycle events (our own schema; see `examples/task_events.jsonl`):
+A grant can be bound to a task: pass `task_id` to `request` (`--task-id` on the CLI). The task_id is part of the signed request, so it can't be swapped or stripped after signing. The runner sends three lifecycle events (our own schema; see `examples/task_events.jsonl`):
 
 ```
 task_open {"task_id": "...", "timestamp": "..."}
-task_end  {"task_id": "...", "timestamp": "...", "destructorOk": true|false}
+task_end       {"task_id": "...", "timestamp": "...", "transition": "done"|"cancelled"|"suspended" (optional)}
+task_destroyed {"task_id": "...", "timestamp": "...", "destructorOk": true|false}
 ```
 
 - A grant bound to a task can be minted and used only while that task is open. An unknown task is refused, and so is a task_id that has already ended (task ids are single-use).
-- When `task_end` arrives, the broker first marks the task ended and revokes its unused grants (minted or pending approval) in one transaction. From then on, any mint or use for that task gets a 403 `task '...' has ended`. It then writes a signed `task_end` receipt with `task_id`, `timestamp`, `destructorOk` and `revoked_grant_ids`.
-- **Teardown belongs to the runner, not the broker.** The broker never kills processes. The runner calls `task_end` first and kills the task's process group only after that returns, so a process still alive during teardown is already refused. `examples/task_runner.py` shows this order. A call that was already claimed (in flight) when `task_end` arrived is not interrupted, and its settle is recorded as usual. `destructorOk` is recorded as reported; revocation happens whatever its value.
+- When `task_end` arrives, the broker first marks the task ended and revokes its unused grants (minted or pending approval) in one transaction. From then on, any mint or use for that task gets a 403 `task '...' has ended`. It then writes a signed `task_end` receipt with `task_id`, `timestamp`, `transition` (if given), `grantsRevoked: true` and `revoked_grant_ids`.
+- **Teardown belongs to the runner, not the broker.** The broker never kills processes. The runner calls `task_end` first and kills the task's process group only after that returns, so a process still alive during teardown is already refused. `examples/task_runner.py` shows this order. A call that was already claimed (in flight) when `task_end` arrived is not interrupted, and its settle is recorded as usual. - **Two facts, two stamps.** The broker can only vouch that grants were revoked, so `task_end` does not take `destructorOk` (it is refused there). After the kill, the runner sends `task_destroyed` with `destructorOk`, which gets its own signed receipt and is accepted once, only for an ended task. `mintcall task stuck` (`Broker.stuck_tasks()`) lists tasks with grants revoked but no `destructorOk=true` stamp, either because `task_destroyed` never came or because it reported failure. That is the list a sweep should flag. Thanks to lousbud_reef on Moltbook for the split.
 
 ## Wrapping an MCP server
 See `examples/mcp_tool_wrapper.py` and `examples/mcp.json`. The tool body calls `call_via_proxy(...)` where it used to call `requests.get(url, headers={key})`. The MCP process never opens the vault and needs no passphrase. If the `mcp` SDK is installed, it runs as a FastMCP server (`--serve`).
 
 ## Tests
-`pytest -q tests` (44 tests) covers reuse, replay to a different path, recipient or body, expiry, forged tokens, a concurrent claim race (32 threads, 1 success), revoke, approval flow, policy denials, cap re-check at use, no charge on failure, tamper detection in the receipt log, and vault encryption. It also covers agent auth: unsigned requests, wrong keys, an agent impersonating another, params or intent changed after signing, nonce replay, stale timestamps, unsigned or mis-signed claims, claim-signature replay, and a stolen grant used by another agent. Plus burn vs N-strikes, key-cache hit/expiry/revoke/shutdown, the notify command and webhook, and the `agent add` CLI. Redirects: 301/302/303 and 307/308 (GET and POST) to another origin are never followed by the proxy or client, and the injected key never reaches the other origin. Task scoping: minting under an open task, refusal after `task_end` and for an unknown task, task_id bound into the signature, the `task_end` receipt contents, and refusal being in place before the runner kills the process group.
+`pytest -q tests` (45 tests) covers reuse, replay to a different path, recipient or body, expiry, forged tokens, a concurrent claim race (32 threads, 1 success), revoke, approval flow, policy denials, cap re-check at use, no charge on failure, tamper detection in the receipt log, and vault encryption. It also covers agent auth: unsigned requests, wrong keys, an agent impersonating another, params or intent changed after signing, nonce replay, stale timestamps, unsigned or mis-signed claims, claim-signature replay, and a stolen grant used by another agent. Plus burn vs N-strikes, key-cache hit/expiry/revoke/shutdown, the notify command and webhook, and the `agent add` CLI. Redirects: 301/302/303 and 307/308 (GET and POST) to another origin are never followed by the proxy or client, and the injected key never reaches the other origin. Task scoping: minting under an open task, refusal after `task_end` and for an unknown task, task_id bound into the signature, the `task_end` receipt contents, refusal being in place before the runner kills the process group, and the separate `task_destroyed` stamp plus the stuck-task list.
 
 ## Latency (`bench/latency.py`, local, fake upstream, real scrypt vault)
 | | median | p95 |

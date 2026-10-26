@@ -379,8 +379,8 @@ def test_cross_origin_redirect_refused_and_key_never_sent(env, code, method):
 
 # ---------- per-task-id grant scoping ----------
 def _open(b, tid="task-1", ts="2026-01-01T00:00:00Z"): return b.task_open({"task_id": tid, "timestamp": ts})
-def _end(b, tid="task-1", ts="2026-01-01T00:05:00Z", ok=True):
-    return b.task_end({"task_id": tid, "timestamp": ts, "destructorOk": ok})
+def _end(b, tid="task-1", ts="2026-01-01T00:05:00Z"):
+    return b.task_end({"task_id": tid, "timestamp": ts})
 
 def test_grant_minted_and_used_under_open_task(env):
     b, api, proxy, *_ = env
@@ -416,7 +416,8 @@ def test_unknown_task_refused(env):
     b, api, proxy, *_ = env
     with pytest.raises(GrantError, match="unknown task 'nope'"): grant(b, api, task_id="nope")
     with pytest.raises(GrantError, match="unknown task"): _end(b, "nope")
-    with pytest.raises(GrantError, match="destructorOk"): b.task_end({"task_id": "nope", "timestamp": "t"})
+    with pytest.raises(GrantError, match="missing field"): b.task_end({"task_id": "nope"})
+    with pytest.raises(GrantError, match="unknown task"): b.task_destroyed({"task_id": "nope", "timestamp": "t", "destructorOk": True})
     with pytest.raises(GrantError, match="unknown lifecycle event"): b.task_event({"event": "task_pause", "task_id": "x"})
 
 def test_task_id_is_covered_by_the_request_signature(env):
@@ -435,12 +436,12 @@ def test_task_end_receipt_lists_revoked_grants_and_is_signed(env):
     used = grant(b, api, task_id="task-r")
     assert send(used["token"], "GET", api + "/v1/items", proxy=proxy)["status"] == 200
     left = [grant(b, api, task_id="task-r")["grant_id"] for _ in range(2)]
-    end = b.task_end({"task_id": "task-r", "timestamp": "2026-01-01T00:07:00Z", "destructorOk": False})
+    end = b.task_end({"task_id": "task-r", "timestamp": "2026-01-01T00:07:00Z", "transition": "cancelled"})
     recs = [json.loads(l) for l in (home / "receipts.jsonl").read_text().splitlines()]
     te = [x for x in recs if x["event"] == "task_end"]
     assert len(te) == 1
-    assert te[0]["data"] == {"task_id": "task-r", "timestamp": "2026-01-01T00:07:00Z", "destructorOk": False,
-                             "revoked_grant_ids": left}
+    assert te[0]["data"] == {"task_id": "task-r", "timestamp": "2026-01-01T00:07:00Z", "transition": "cancelled",
+                             "grantsRevoked": True, "revoked_grant_ids": left}
     assert used["grant_id"] not in te[0]["data"]["revoked_grant_ids"]      # settled grants are not "revoked"
     assert end["receipt_ref"].endswith(te[0]["hash"][:16])
     opened = [x for x in recs if x["event"] == "task_open"][0]["data"]
@@ -469,25 +470,57 @@ def test_refusal_is_in_place_before_runner_teardown(env):
     finally:
         task_runner.os.killpg = real_killpg
     assert "has ended" in seen["refused"] and "has ended" in seen["mint"]
-    assert end["state"] == "ended"
+    assert end["state"] == "ended" and end["destroyed"]["destructorOk"] is True
+    assert b.stuck_tasks() == []
 
 def test_example_task_events_apply_cleanly(env):
     b, api, *_ = env
     path = os.path.join(os.path.dirname(__file__), "..", "examples", "task_events.jsonl")
     evs = [json.loads(l) for l in open(path) if l.strip()]
-    assert [e["event"] for e in evs] == ["task_open", "task_end"]
+    assert [e["event"] for e in evs] == ["task_open", "task_end", "task_destroyed"]
     assert b.task_event(evs[0])["state"] == "open"
     g = grant(b, api, task_id=evs[0]["task_id"])
     out = b.task_event(evs[1])
-    assert out["revoked_grant_ids"] == [g["grant_id"]]
+    assert out["revoked_grant_ids"] == [g["grant_id"]] and out["grantsRevoked"] is True
+    assert b.task_event(evs[2])["state"] == "destroyed"
 
 def test_task_cli_open_end_and_event_file(tmp_path, capsys):
     from mintcall.cli import main
     h = ["--home", str(tmp_path)]
     assert main(h + ["init"]) == 0
     assert main(h + ["task", "open", "t-cli", "--timestamp", "2026-01-01T00:00:00Z"]) == 0
-    assert main(h + ["task", "end", "t-cli", "--destructor-ok"]) == 0
+    assert main(h + ["task", "end", "t-cli", "--transition", "done"]) == 0
     assert '"state": "ended"' in capsys.readouterr().out
-    assert main(h + ["task", "end", "t-cli", "--destructor-ok"]) == 2
+    assert main(h + ["task", "end", "t-cli"]) == 2
+    assert main(h + ["task", "stuck"]) == 0 and '"t-cli"' in capsys.readouterr().out
+    assert main(h + ["task", "destroyed", "t-cli", "--destructor-ok"]) == 0
+    assert '"destructorOk": true' in capsys.readouterr().out
+    assert main(h + ["task", "stuck"]) == 0 and capsys.readouterr().out.strip() == "[]"
     ev = tmp_path / "ev.json"; ev.write_text(json.dumps({"event": "task_open", "task_id": "t2", "timestamp": "x"}))
     assert main(h + ["task", "event", str(ev)]) == 0
+
+
+def test_destructor_is_a_separate_stamp_after_task_end(env):
+    """Two facts, two stamps: grantsRevoked (broker, at task_end) then destructorOk (runner, after the kill)."""
+    b, api, _, _, home = env
+    _open(b, "t-s")
+    with pytest.raises(GrantError, match="still open"):
+        b.task_destroyed({"task_id": "t-s", "timestamp": "t", "destructorOk": True})
+    with pytest.raises(GrantError, match="send it after the kill as task_destroyed"):
+        b.task_end({"task_id": "t-s", "timestamp": "t", "destructorOk": True})
+    with pytest.raises(GrantError, match="transition must be"):
+        b.task_end({"task_id": "t-s", "timestamp": "t", "transition": "paused"})
+    _end(b, "t-s")
+    assert [x["task_id"] for x in b.stuck_tasks()] == ["t-s"]            # revoked, no destructor stamp yet
+    assert b.stuck_tasks()[0]["reason"] == "no task_destroyed after task_end"
+    d = b.task_destroyed({"task_id": "t-s", "timestamp": "t2", "destructorOk": False})
+    assert d["state"] == "destructor_failed"
+    assert b.stuck_tasks()[0]["reason"] == "destructorOk=false"           # a failed teardown stays flagged
+    with pytest.raises(GrantError, match="already has a destructor stamp"):
+        b.task_destroyed({"task_id": "t-s", "timestamp": "t3", "destructorOk": True})
+    recs = [json.loads(l) for l in (home / "receipts.jsonl").read_text().splitlines()]
+    assert [x["data"] for x in recs if x["event"] == "task_destroyed"] == [{"task_id": "t-s", "timestamp": "t2", "destructorOk": False}]
+    ok, n, _ = b.log.verify(); assert ok and n == len(recs)
+    _open(b, "t-ok"); _end(b, "t-ok")
+    b.task_destroyed({"task_id": "t-ok", "timestamp": "t", "destructorOk": True})
+    assert "t-ok" not in [x["task_id"] for x in b.stuck_tasks()]

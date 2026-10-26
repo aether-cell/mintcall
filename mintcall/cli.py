@@ -39,13 +39,16 @@ def main(argv=None):
     aa.add_argument("agent_id"); aa.add_argument("--out", help="where to write the agent's private key (0600)")
     aa.add_argument("--public-key", help="register this base64 Ed25519 public key instead of generating one")
     ar = ags.add_parser("remove"); ar.add_argument("agent_id"); ags.add_parser("list")
-    tk = s.add_parser("task", help="runner side: task lifecycle events (task_open / task_end)")
+    tk = s.add_parser("task", help="runner side: task lifecycle events (task_open / task_end / task_destroyed)")
     tks = tk.add_subparsers(dest="task_cmd", required=True)
     to = tks.add_parser("open"); to.add_argument("task_id"); to.add_argument("--timestamp")
     te = tks.add_parser("end", help="refuse further grants/uses for the task; run BEFORE killing its process group")
-    te.add_argument("task_id"); te.add_argument("--timestamp")
-    dg = te.add_mutually_exclusive_group(required=True)
+    te.add_argument("task_id"); te.add_argument("--timestamp"); te.add_argument("--transition", choices=["done", "cancelled", "suspended"])
+    td = tks.add_parser("destroyed", help="runner reports teardown AFTER killing the process group")
+    td.add_argument("task_id"); td.add_argument("--timestamp")
+    dg = td.add_mutually_exclusive_group(required=True)
     dg.add_argument("--destructor-ok", dest="dok", action="store_true"); dg.add_argument("--destructor-failed", dest="dok", action="store_false")
+    tks.add_parser("stuck", help="list ended tasks with grants revoked but no destructorOk=true stamp")
     tf = tks.add_parser("event", help="apply a JSON lifecycle event from a file ('-' = stdin)"); tf.add_argument("file")
     sg = s.add_parser("sign-claim", help="agent side: print X-Mintcall-* auth headers for a claim")
     sg.add_argument("--agent-key", required=True); sg.add_argument("--token", required=True)
@@ -98,7 +101,12 @@ def main(argv=None):
             from datetime import datetime, timezone
             ts = lambda: getattr(a, "timestamp", None) or datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
             if a.task_cmd == "open": out = broker(a).task_open({"task_id": a.task_id, "timestamp": ts()})
-            elif a.task_cmd == "end": out = broker(a).task_end({"task_id": a.task_id, "timestamp": ts(), "destructorOk": a.dok})
+            elif a.task_cmd == "end":
+                ev = {"task_id": a.task_id, "timestamp": ts()}
+                if a.transition: ev["transition"] = a.transition
+                out = broker(a).task_end(ev)
+            elif a.task_cmd == "destroyed": out = broker(a).task_destroyed({"task_id": a.task_id, "timestamp": ts(), "destructorOk": a.dok})
+            elif a.task_cmd == "stuck": out = broker(a).stuck_tasks()
             else: out = broker(a).task_event(json.loads(sys.stdin.read() if a.file == "-" else Path(a.file).read_text()))
             print(json.dumps(out, indent=2))
         elif a.cmd == "sign-claim":

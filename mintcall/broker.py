@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS spend(agent_id TEXT, credential TEXT, amount REAL, gr
 CREATE TABLE IF NOT EXISTS nonces(nonce TEXT PRIMARY KEY, agent_id TEXT, ts REAL);
 CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v INTEGER);
 CREATE TABLE IF NOT EXISTS tasks(task_id TEXT PRIMARY KEY, state TEXT NOT NULL, opened_at TEXT,
-  ended_at TEXT, destructor_ok INTEGER, end_receipt TEXT);
+  ended_at TEXT, destructor_ok INTEGER, end_receipt TEXT, destroyed_at TEXT, destroy_receipt TEXT);
 """
 
 TASK_ID_MAX = 128
@@ -72,6 +72,9 @@ class Broker:
         except sqlite3.OperationalError: pass  # already migrated
         try: self.db.execute("ALTER TABLE grants ADD COLUMN task_id TEXT")
         except sqlite3.OperationalError: pass  # already migrated
+        for col in ("destroyed_at TEXT", "destroy_receipt TEXT"):
+            try: self.db.execute(f"ALTER TABLE tasks ADD COLUMN {col}")
+            except sqlite3.OperationalError: pass
         self.agents = agents or AgentRegistry(self.home / "agents.json")
         self.require_auth = require_auth
         self.notify_threads = []
@@ -166,23 +169,31 @@ class Broker:
         ref = self.log.append("task_open", task_id=tid, timestamp=str(event["timestamp"]))
         return {"task_id": tid, "state": "open", "receipt_ref": ref}
 
+    TRANSITIONS = ("done", "cancelled", "suspended")
+
     @_locked
     def task_end(self, event):
-        """event = {"task_id": str, "timestamp": str, "destructorOk": bool}.
+        """event = {"task_id": str, "timestamp": str, "transition"?: "done"|"cancelled"|"suspended"}.
         In ONE transaction: mark the task ended (so every later mint or claim bound to it is refused with
         a task-ended reason) and revoke its unused grants (minted / pending_approval). Then write a signed
-        task_end receipt listing the revoked grant ids. Only after this returns should the runner kill the
-        task's process group; the broker never kills anything. A grant already claimed (call in flight)
-        is not interrupted; its settle is recorded as usual."""
-        self._check_event(event, "task_end", ("task_id", "timestamp", "destructorOk"))
-        if not isinstance(event["destructorOk"], bool): raise GrantError("task_end: destructorOk must be true or false")
-        tid, ts, dok = event["task_id"], str(event["timestamp"]), event["destructorOk"]
+        task_end receipt (grantsRevoked) listing the revoked grant ids. Only after this returns should the
+        runner kill the task's process group; the broker never kills anything. A grant already claimed
+        (call in flight) is not interrupted; its settle is recorded as usual.
+        destructorOk is NOT part of task_end: the broker can only vouch for revocation. The runner reports
+        teardown separately with task_destroyed, after the kill."""
+        self._check_event(event, "task_end", ("task_id", "timestamp"))
+        if "destructorOk" in event:
+            raise GrantError("task_end: destructorOk is not accepted here; send it after the kill as task_destroyed")
+        tr = event.get("transition")
+        if tr is not None and tr not in self.TRANSITIONS:
+            raise GrantError(f"task_end: transition must be one of {', '.join(self.TRANSITIONS)}")
+        tid, ts = event["task_id"], str(event["timestamp"])
         self.db.execute("BEGIN IMMEDIATE")
         try:
             row = self.db.execute("SELECT state FROM tasks WHERE task_id=?", (tid,)).fetchone()
             if not row: raise GrantError(f"task_end: unknown task {tid!r}")
             if row[0] != "open": raise GrantError(f"task_end: task {tid!r} already ended")
-            self.db.execute("UPDATE tasks SET state='ended', ended_at=?, destructor_ok=? WHERE task_id=?", (ts, int(dok), tid))
+            self.db.execute("UPDATE tasks SET state='ended', ended_at=? WHERE task_id=?", (ts, tid))
             ids = [r[0] for r in self.db.execute(
                 "SELECT grant_id FROM grants WHERE task_id=? AND status IN ('minted','pending_approval') ORDER BY created", (tid,))]
             self.db.execute("UPDATE grants SET status='revoked' WHERE task_id=? AND status IN ('minted','pending_approval')", (tid,))
@@ -191,16 +202,42 @@ class Broker:
         except Exception:
             if self.db.in_transaction: self.db.execute("ROLLBACK")
             raise
-        ref = self.log.append("task_end", task_id=tid, timestamp=ts, destructorOk=dok, revoked_grant_ids=ids)
+        extra = {"transition": tr} if tr else {}
+        ref = self.log.append("task_end", task_id=tid, timestamp=ts, **extra, grantsRevoked=True, revoked_grant_ids=ids)
         self.db.execute("UPDATE tasks SET end_receipt=? WHERE task_id=?", (ref, tid))
-        return {"task_id": tid, "state": "ended", "revoked_grant_ids": ids, "receipt_ref": ref}
+        return {"task_id": tid, "state": "ended", "grantsRevoked": True, "revoked_grant_ids": ids, "receipt_ref": ref}
+
+    @_locked
+    def task_destroyed(self, event):
+        """event = {"task_id": str, "timestamp": str, "destructorOk": bool}. Sent by the runner AFTER it
+        killed the task's process group (and released whatever else the task held). Accepted only once,
+        and only for a task that already ended. Writes a signed task_destroyed receipt."""
+        self._check_event(event, "task_destroyed", ("task_id", "timestamp", "destructorOk"))
+        if not isinstance(event["destructorOk"], bool): raise GrantError("task_destroyed: destructorOk must be true or false")
+        tid, ts, dok = event["task_id"], str(event["timestamp"]), event["destructorOk"]
+        row = self.db.execute("SELECT state, destroyed_at FROM tasks WHERE task_id=?", (tid,)).fetchone()
+        if not row: raise GrantError(f"task_destroyed: unknown task {tid!r}")
+        if row[0] == "open": raise GrantError(f"task_destroyed: task {tid!r} is still open; send task_end first (refuse, then kill)")
+        if row[1] is not None: raise GrantError(f"task_destroyed: task {tid!r} already has a destructor stamp")
+        ref = self.log.append("task_destroyed", task_id=tid, timestamp=ts, destructorOk=dok)
+        self.db.execute("UPDATE tasks SET destroyed_at=?, destructor_ok=?, destroy_receipt=? WHERE task_id=?", (ts, int(dok), ref, tid))
+        return {"task_id": tid, "state": "destroyed" if dok else "destructor_failed", "destructorOk": dok, "receipt_ref": ref}
+
+    def stuck_tasks(self):
+        """Tasks a sweep should flag: grants revoked (task_end) but no destructorOk=true stamp yet,
+        either because task_destroyed never arrived or because it reported failure."""
+        rows = self.db.execute("SELECT task_id, ended_at, destroyed_at, destructor_ok FROM tasks WHERE state='ended' "
+                               "AND (destroyed_at IS NULL OR destructor_ok=0) ORDER BY ended_at").fetchall()
+        return [{"task_id": t, "ended_at": e, "reason": "no task_destroyed after task_end" if d is None else "destructorOk=false"}
+                for t, e, d, _ in rows]
 
     def task_event(self, event):
-        """Dispatch a lifecycle event carrying "event": "task_open" | "task_end"."""
+        """Dispatch a lifecycle event carrying "event": "task_open" | "task_end" | "task_destroyed"."""
         kind = event.get("event") if isinstance(event, dict) else None
         if kind == "task_open": return self.task_open(event)
         if kind == "task_end": return self.task_end(event)
-        raise GrantError(f"unknown lifecycle event {kind!r} (expected task_open or task_end)")
+        if kind == "task_destroyed": return self.task_destroyed(event)
+        raise GrantError(f"unknown lifecycle event {kind!r} (expected task_open, task_end or task_destroyed)")
 
     def _use_nonce(self, auth):
         now = self.now()
