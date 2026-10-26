@@ -526,6 +526,31 @@ def test_destructor_is_a_separate_stamp_after_task_end(env):
     assert "t-ok" not in [x["task_id"] for x in b.stuck_tasks()]
 
 
+def test_stuck_list_ages_on_broker_clock(env):
+    """age_s comes from the broker clock at task_end, not the runner's timestamp; --older-than filters for escalation."""
+    b, _, _, clk, _ = env
+    _open(b, "t-old"); _end(b, "t-old", ts="1999-01-01T00:00:00Z")   # a lying runner timestamp does not age the entry
+    clk.t += 600
+    _open(b, "t-new"); _end(b, "t-new")
+    clk.t += 30
+    st = {x["task_id"]: x for x in b.stuck_tasks()}
+    assert st["t-old"]["age_s"] == 630 and st["t-new"]["age_s"] == 30
+    assert [x["task_id"] for x in b.stuck_tasks()] == ["t-old", "t-new"]       # oldest first
+    assert [x["task_id"] for x in b.stuck_tasks(older_than=300)] == ["t-old"]
+    b.task_destroyed({"task_id": "t-old", "timestamp": "t", "destructorOk": True})
+    assert b.stuck_tasks(older_than=300) == []
+
+
+def test_cli_stuck_older_than(tmp_path, capsys):
+    from mintcall.cli import main
+    h = ["--home", str(tmp_path)]
+    assert main(h + ["init"]) == 0
+    assert main(h + ["task", "open", "t-cli2"]) == 0 and main(h + ["task", "end", "t-cli2"]) == 0
+    capsys.readouterr()
+    assert main(h + ["task", "stuck", "--older-than", "3600"]) == 0 and capsys.readouterr().out.strip() == "[]"
+    assert main(h + ["task", "stuck", "--older-than", "0"]) == 0 and '"age_s"' in capsys.readouterr().out
+
+
 # ---------- unknown outcome: a timeout is not a failure ----------
 def _silent_upstream():
     """Accepts the request, reads it, never answers: the request was delivered, the response is lost."""

@@ -52,7 +52,8 @@ def main(argv=None):
     td.add_argument("task_id"); td.add_argument("--timestamp")
     dg = td.add_mutually_exclusive_group(required=True)
     dg.add_argument("--destructor-ok", dest="dok", action="store_true"); dg.add_argument("--destructor-failed", dest="dok", action="store_false")
-    tks.add_parser("stuck", help="list ended tasks with grants revoked but no destructorOk=true stamp")
+    tst = tks.add_parser("stuck", help="list ended tasks with grants revoked but no destructorOk=true stamp")
+    tst.add_argument("--older-than", type=float, metavar="SECONDS", help="only tasks ended at least this long ago (broker clock)")
     tf = tks.add_parser("event", help="apply a JSON lifecycle event from a file ('-' = stdin)"); tf.add_argument("file")
     sg = s.add_parser("sign-claim", help="agent side: print X-Mintcall-* auth headers for a claim")
     sg.add_argument("--agent-key", required=True); sg.add_argument("--token", required=True)
@@ -111,7 +112,7 @@ def main(argv=None):
                 if a.transition: ev["transition"] = a.transition
                 out = broker(a).task_end(ev)
             elif a.task_cmd == "destroyed": out = broker(a).task_destroyed({"task_id": a.task_id, "timestamp": ts(), "destructorOk": a.dok})
-            elif a.task_cmd == "stuck": out = broker(a).stuck_tasks()
+            elif a.task_cmd == "stuck": out = broker(a).stuck_tasks(older_than=a.older_than)
             else: out = broker(a).task_event(json.loads(sys.stdin.read() if a.file == "-" else Path(a.file).read_text()))
             print(json.dumps(out, indent=2))
         elif a.cmd == "sign-claim":

@@ -73,7 +73,7 @@ class Broker:
         except sqlite3.OperationalError: pass  # already migrated
         try: self.db.execute("ALTER TABLE grants ADD COLUMN task_id TEXT")
         except sqlite3.OperationalError: pass  # already migrated
-        for col in ("destroyed_at TEXT", "destroy_receipt TEXT"):
+        for col in ("destroyed_at TEXT", "destroy_receipt TEXT", "ended_clock REAL"):
             try: self.db.execute(f"ALTER TABLE tasks ADD COLUMN {col}")
             except sqlite3.OperationalError: pass
         self.agents = agents or AgentRegistry(self.home / "agents.json")
@@ -201,7 +201,7 @@ class Broker:
             row = self.db.execute("SELECT state FROM tasks WHERE task_id=?", (tid,)).fetchone()
             if not row: raise GrantError(f"task_end: unknown task {tid!r}")
             if row[0] != "open": raise GrantError(f"task_end: task {tid!r} already ended")
-            self.db.execute("UPDATE tasks SET state='ended', ended_at=? WHERE task_id=?", (ts, tid))
+            self.db.execute("UPDATE tasks SET state='ended', ended_at=?, ended_clock=? WHERE task_id=?", (ts, self.now(), tid))
             ids = [r[0] for r in self.db.execute(
                 "SELECT grant_id FROM grants WHERE task_id=? AND status IN ('minted','pending_approval') ORDER BY created", (tid,))]
             self.db.execute("UPDATE grants SET status='revoked' WHERE task_id=? AND status IN ('minted','pending_approval')", (tid,))
@@ -231,13 +231,21 @@ class Broker:
         self.db.execute("UPDATE tasks SET destroyed_at=?, destructor_ok=?, destroy_receipt=? WHERE task_id=?", (ts, int(dok), ref, tid))
         return {"task_id": tid, "state": "destroyed" if dok else "destructor_failed", "destructorOk": dok, "receipt_ref": ref}
 
-    def stuck_tasks(self):
+    def stuck_tasks(self, older_than=None):
         """Tasks a sweep should flag: grants revoked (task_end) but no destructorOk=true stamp yet,
-        either because task_destroyed never arrived or because it reported failure."""
-        rows = self.db.execute("SELECT task_id, ended_at, destroyed_at, destructor_ok FROM tasks WHERE state='ended' "
-                               "AND (destroyed_at IS NULL OR destructor_ok=0) ORDER BY ended_at").fetchall()
-        return [{"task_id": t, "ended_at": e, "reason": "no task_destroyed after task_end" if d is None else "destructorOk=false"}
-                for t, e, d, _ in rows]
+        either because task_destroyed never arrived or because it reported failure.
+        age_s is measured on the broker's own clock from task_end (the runner's timestamp is not trusted for this);
+        older_than (seconds) keeps only entries at least that old. The broker does not escalate; the reader does."""
+        now = self.now()
+        rows = self.db.execute("SELECT task_id, ended_at, destroyed_at, destructor_ok, ended_clock FROM tasks WHERE state='ended' "
+                               "AND (destroyed_at IS NULL OR destructor_ok=0) ORDER BY COALESCE(ended_clock, 0), ended_at").fetchall()
+        out = []
+        for t, e, d, _, c in rows:
+            age = None if c is None else round(now - c, 3)
+            if older_than is not None and (age is None or age < older_than) and c is not None: continue
+            out.append({"task_id": t, "ended_at": e, "age_s": age,
+                        "reason": "no task_destroyed after task_end" if d is None else "destructorOk=false"})
+        return out
 
     def task_event(self, event):
         """Dispatch a lifecycle event carrying "event": "task_open" | "task_end" | "task_destroyed"."""
