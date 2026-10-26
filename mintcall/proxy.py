@@ -1,7 +1,7 @@
 """Local HTTP forward proxy. The agent sends its call (absolute URL in the request line, or
 X-Mintcall-Target) plus X-Mintcall-Grant. The proxy claims the grant against the exact request,
 injects the real key from the vault, forwards, and settles. The key never reaches the agent."""
-import hashlib, threading, urllib.request, urllib.error
+import hashlib, socket, threading, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from .broker import GrantError
 from .agents import auth_from_headers
@@ -16,6 +16,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *a, **kw): return None
 
 _OPENER = urllib.request.build_opener(_NoRedirect)
+UPSTREAM_TIMEOUT = 30.0
 
 def make_handler(broker, keys):
     state = {"epoch": broker.revoke_epoch()}
@@ -47,13 +48,20 @@ def make_handler(broker, keys):
             hdrs[cred["header"]] = cred["format"].format(secret=cred["secret"])
             req = urllib.request.Request(url, data=body or None, method=self.command, headers=hdrs)
             try:
-                with _OPENER.open(req, timeout=30) as r:
+                with _OPENER.open(req, timeout=UPSTREAM_TIMEOUT) as r:
                     data, code, rh = r.read(), r.status, r.getheaders()
             except urllib.error.HTTPError as e:
                 data, code, rh = e.read(), e.code, list(e.headers.items())
             except Exception as e:
-                broker.settle(c, ok=False, status_code=None)
-                return self._reply(502, f"upstream error: {e}".encode())
+                reason = getattr(e, "reason", e)
+                if isinstance(reason, (ConnectionRefusedError, socket.gaierror)):   # refused / DNS failure: never sent
+                    broker.settle(c, ok=False, status_code=None)
+                    return self._reply(502, f"upstream error: {e}".encode(), [("X-Mintcall-Outcome", "not_sent")])
+                # the request may have been delivered: outcome unknown, not failed
+                broker.settle(c, ok=False, unresolved=f"{type(e).__name__}: {e}")
+                return self._reply(504, f"upstream outcome unknown: {e}. mintcall will not grant an identical write "
+                                        f"until `mintcall resolve {c['grant_id']}` records what happened".encode(),
+                                   [("X-Mintcall-Outcome", "unknown"), ("X-Mintcall-Settled", "0")])
             ok = 200 <= code < 300
             secret = cred["secret"].encode()
             data = data.replace(secret, b"[REDACTED]")  # never echo the key back

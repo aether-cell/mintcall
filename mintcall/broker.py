@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS tasks(task_id TEXT PRIMARY KEY, state TEXT NOT NULL, 
 """
 
 TASK_ID_MAX = 128
+SAFE_METHODS = ("GET", "HEAD", "OPTIONS")  # reads: retrying them never spends authority twice
 
 def _th(t): return hashlib.sha256(t.encode()).hexdigest()
 
@@ -113,6 +114,13 @@ class Broker:
         decision, reason, rule = self.policy.evaluate(agent_id, credential, method,
                                                       urlsplit(url).path or "/", list(scope), cap, ttl)
         rh = request_hash(method, url, body)
+        if method.upper() not in SAFE_METHODS:
+            u = self.db.execute("SELECT grant_id FROM grants WHERE agent_id=? AND request_hash=? AND status='unresolved'",
+                                (agent_id, rh)).fetchone()
+            if u:
+                why = f"an identical call (grant {u[0]}) has an unknown outcome; resolve it before retrying"
+                self.log.append("deny", agent_id=agent_id, url=url, reason=why)
+                raise GrantError(why)
         base = dict(agent_id=agent_id, credential=credential, method=method.upper(), url=url,
                     request_hash=rh, scope=list(scope), cap=cap, ttl=ttl, intent=intent or {},
                     **({"task_id": task_id} if task_id is not None else {}))
@@ -332,8 +340,15 @@ class Broker:
 
     # settle only on success
     @_locked
-    def settle(self, claim, ok, status_code=None, cost=None, response_sha256=None):
+    def settle(self, claim, ok, status_code=None, cost=None, response_sha256=None, unresolved=None):
+        """unresolved: reason string when the request may have reached upstream but no response came back
+        (timeout, reset). Outcome is unknown, not failed: nothing is charged yet, and an identical write
+        cannot be granted again until resolve() records what actually happened."""
         gid = claim["grant_id"]
+        if unresolved:
+            self.db.execute("UPDATE grants SET status='unresolved' WHERE grant_id=?", (gid,))
+            self.log.append("unresolved", grant_id=gid, reason=str(unresolved), charged=0.0)
+            return
         if ok:
             amt = claim["cap"] if cost is None else min(cost, claim["cap"])
             self.db.execute("INSERT INTO spend VALUES(?,?,?,?,?)", (claim["agent_id"], claim["credential"], amt, gid, self.now()))
@@ -343,6 +358,20 @@ class Broker:
             self.db.execute("UPDATE grants SET status='failed' WHERE grant_id=?", (gid,))
         extra = {"response_sha256": response_sha256} if response_sha256 else {}
         self.log.append("settle" if ok else "fail_no_charge", grant_id=gid, upstream_status=status_code, charged=amt, **extra)
+
+    @_locked
+    def resolve(self, grant_id, performed, by="user", note=""):
+        """Record the real outcome of an unresolved call, after checking it upstream (operation status,
+        idempotency key lookup, or a human looking). performed=True charges the cap as a settle would."""
+        row = self.db.execute("SELECT agent_id, credential, cap, status FROM grants WHERE grant_id=?", (grant_id,)).fetchone()
+        if not row or row[3] != "unresolved": raise GrantError("not unresolved")
+        amt = float(row[2]) if performed else 0.0
+        if performed:
+            self.db.execute("INSERT INTO spend VALUES(?,?,?,?,?)", (row[0], row[1], amt, grant_id, self.now()))
+        self.db.execute("UPDATE grants SET status=? WHERE grant_id=?", ("settled" if performed else "failed", grant_id))
+        self.log.append("resolve", grant_id=grant_id, performed=bool(performed), charged=amt, by=by,
+                        **({"note": note} if note else {}))
+        return {"grant_id": grant_id, "status": "settled" if performed else "failed", "charged": amt}
 
     @_locked
     def expire_sweep(self):

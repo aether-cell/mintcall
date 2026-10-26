@@ -29,6 +29,10 @@ def main(argv=None):
     for n in ("approve", "revoke"):
         x = s.add_parser(n); x.add_argument("grant_id", nargs="?")
         if n == "revoke": x.add_argument("--agent")
+    rs = s.add_parser("resolve", help="record the real outcome of a call whose upstream response never came back")
+    rs.add_argument("grant_id"); rs.add_argument("--note")
+    og = rs.add_mutually_exclusive_group(required=True)
+    og.add_argument("--performed", dest="performed", action="store_true"); og.add_argument("--not-performed", dest="performed", action="store_false")
     l = s.add_parser("list"); l.add_argument("--status")
     s.add_parser("sweep", help="mark timed-out grants expired")
     s.add_parser("verify-log", help="verify signed receipt chain")
@@ -74,6 +78,7 @@ def main(argv=None):
                 scope=sc, cap=a.cap, ttl=a.ttl, intent=intent, auth=auth, task_id=a.task_id)
             print(json.dumps(g, indent=2))
         elif a.cmd == "approve": broker(a).approve(a.grant_id); print("approved", a.grant_id)
+        elif a.cmd == "resolve": print(json.dumps(broker(a).resolve(a.grant_id, a.performed, note=a.note or "")))
         elif a.cmd == "revoke": print("revoked", broker(a).revoke(a.grant_id, a.agent))
         elif a.cmd == "list":
             for g in broker(a).list(a.status):

@@ -524,3 +524,65 @@ def test_destructor_is_a_separate_stamp_after_task_end(env):
     _open(b, "t-ok"); _end(b, "t-ok")
     b.task_destroyed({"task_id": "t-ok", "timestamp": "t", "destructorOk": True})
     assert "t-ok" not in [x["task_id"] for x in b.stuck_tasks()]
+
+
+# ---------- unknown outcome: a timeout is not a failure ----------
+def _silent_upstream():
+    """Accepts the request, reads it, never answers: the request was delivered, the response is lost."""
+    import socket
+    srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(5); conns = []
+    def loop():
+        while True:
+            try: c, _ = srv.accept()
+            except OSError: return
+            c.recv(65536); conns.append(c)
+    threading.Thread(target=loop, daemon=True).start()
+    return srv, conns
+
+def test_timeout_is_unresolved_and_blocks_identical_write(tmp_path, monkeypatch):
+    import mintcall.proxy as mp
+    monkeypatch.setattr(mp, "UPSTREAM_TIMEOUT", 0.5)
+    srv, conns = _silent_upstream(); api = f"http://127.0.0.1:{srv.getsockname()[1]}"
+    v = FileVault(tmp_path / "c.vault", passphrase="pw"); v.put("demo-api", KEY, api)
+    b = Broker(tmp_path, policy=Policy(json.loads(json.dumps(DEFAULT_POLICY))), vault=v)
+    b.agents.add("demo-agent", AGENT.public_b64())
+    px = serve(b, port=0, background=True); proxy = f"http://127.0.0.1:{px.server_port}"
+    try:
+        g = grant(b, api, "/v1/orders", "POST", b'{"qty":1}', cap=2); b.approve(g["grant_id"])
+        r = send(g["token"], "POST", api + "/v1/orders", b'{"qty":1}', proxy=proxy)
+        assert r["status"] == 504 and r["headers"].get("X-Mintcall-Outcome") == "unknown"
+        assert b.list()[0]["status"] == "unresolved" and b.spent("demo-agent", "demo-api") == 0
+        # the identical write cannot be granted again while the first one's fate is unknown
+        with pytest.raises(GrantError, match="unknown outcome"):
+            grant(b, api, "/v1/orders", "POST", b'{"qty":1}', cap=2)
+        # a different write, and reads, are not blocked
+        grant(b, api, "/v1/orders", "POST", b'{"qty":2}', cap=2)
+        grant(b, api, "/v1/orders")
+        out = b.resolve(g["grant_id"], performed=True, note="order exists upstream")
+        assert out == {"grant_id": g["grant_id"], "status": "settled", "charged": 2.0}
+        assert b.spent("demo-agent", "demo-api") == 2.0
+        with pytest.raises(GrantError, match="not unresolved"): b.resolve(g["grant_id"], performed=False)
+        grant(b, api, "/v1/orders", "POST", b'{"qty":1}', cap=2)   # resolved: a deliberate new order is allowed
+        recs = [json.loads(l) for l in (tmp_path / "receipts.jsonl").read_text().splitlines()]
+        assert [x["event"] for x in recs if x["event"] in ("unresolved", "resolve")] == ["unresolved", "resolve"]
+        ok, n, _ = b.log.verify(); assert ok and n == len(recs)
+    finally:
+        px.shutdown(); srv.close()
+        for c in conns: c.close()
+
+def test_connection_refused_is_a_plain_failure(tmp_path):
+    import socket
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]; s.close()   # nothing listens here
+    api = f"http://127.0.0.1:{port}"
+    v = FileVault(tmp_path / "c.vault", passphrase="pw"); v.put("demo-api", KEY, api)
+    b = Broker(tmp_path, policy=Policy(json.loads(json.dumps(DEFAULT_POLICY))), vault=v)
+    b.agents.add("demo-agent", AGENT.public_b64())
+    px = serve(b, port=0, background=True); proxy = f"http://127.0.0.1:{px.server_port}"
+    try:
+        g = grant(b, api, "/v1/orders", "POST", b"{}", cap=2); b.approve(g["grant_id"])
+        r = send(g["token"], "POST", api + "/v1/orders", b"{}", proxy=proxy)
+        assert r["status"] == 502 and r["headers"].get("X-Mintcall-Outcome") == "not_sent"
+        assert b.list()[0]["status"] == "failed"
+        grant(b, api, "/v1/orders", "POST", b"{}", cap=2)          # never sent, so a retry is safe
+    finally:
+        px.shutdown()
